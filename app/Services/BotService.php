@@ -5,7 +5,6 @@ namespace App\Services;
 use App\Models\Message;
 use App\Models\Participant;
 use App\Models\Ticket;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class BotService
@@ -49,9 +48,22 @@ class BotService
             return;
         }
 
-        // /start
+        // /start — сброс «залипания» на старом тикете не делаем, просто приветствие
         if (str_starts_with($text, '/start')) {
-            $reply = "Здравствуйте! Я бот поддержки акции «Вкусная осень» бренда «Молочный край».\n\nЗадайте вопрос по правилам акции — срокам, продукции, призам, регистрации чеков. Если понадобится — передам обращение оператору.";
+            $reply = "Здравствуйте! Я бот поддержки акции «Вкусная осень» бренда «Молочный край».\n\nЗадайте вопрос по правилам акции — срокам, продукции, призам, регистрации чеков.\n\nКоманды:\n/start — приветствие\n/new — начать новый диалог (если открыто обращение к оператору, бот снова отвечает сам на типовые вопросы)";
+            $this->saveMessage($participant, 'user', $text);
+            $this->saveMessage($participant, 'bot', $reply);
+            $this->telegram->sendMessage($chatId, $reply);
+            return;
+        }
+
+        // /new — пользователь хочет снова получать автоответы, не только «передано оператору»
+        if (str_starts_with($text, '/new')) {
+            $open = $participant->openTicket();
+            if ($open) {
+                $open->close();
+            }
+            $reply = 'Хорошо, продолжаем. Задайте вопрос по акции — отвечу по правилам. Если понадобится оператор, передам обращение.';
             $this->saveMessage($participant, 'user', $text);
             $this->saveMessage($participant, 'bot', $reply);
             $this->telegram->sendMessage($chatId, $reply);
@@ -60,18 +72,8 @@ class BotService
 
         $this->saveMessage($participant, 'user', $text);
 
-        // If there is an open ticket — just notify and attach message
-        $openTicket = $participant->openTicket();
-        if ($openTicket) {
-            $this->saveMessage($participant, 'user', $text, false, $openTicket->id);
-            $openTicket->update(['last_user_message' => $text]);
-            $reply = 'Ваше сообщение добавлено к обращению #' . $openTicket->id . '. Оператор ответит в этот чат.';
-            $this->saveMessage($participant, 'bot', $reply, false, $openTicket->id);
-            $this->telegram->sendMessage($chatId, $reply);
-            return;
-        }
-
-        // LLM / rules
+        // Всегда сначала пытаемся ответить по правилам / LLM.
+        // Открытый тикет НЕ блокирует автоответы на типовые вопросы.
         $history = $participant->messages()
             ->orderByDesc('id')
             ->limit(10)
@@ -83,13 +85,20 @@ class BotService
 
         $result = $this->llm->chat($text, $participant, $history);
 
-        $answer = $result['answer'] ?? 'Не удалось сформировать ответ. Передаю оператору.';
+        $answer = $result['answer'] ?? 'Не удалось сформировать ответ.';
         $escalate = (bool) ($result['escalate'] ?? false);
 
+        $openTicket = $participant->openTicket();
+
         if ($escalate) {
-            $ticket = $this->createTicket($participant, $text, $result['reason'] ?? null);
+            if ($openTicket) {
+                $ticket = $openTicket;
+                $ticket->update(['last_user_message' => $text]);
+            } else {
+                $ticket = $this->createTicket($participant, $text, $result['reason'] ?? null);
+            }
             $this->saveMessage($participant, 'bot', $answer, false, $ticket->id);
-            $answer .= "\n\n📨 Обращение #" . $ticket->id . " передано оператору. Ответ придёт в этот чат.";
+            $answer .= "\n\n📨 Обращение #" . $ticket->id . " передано оператору. Ответ придёт в этот чат.\n(Типовые вопросы по правилам можно задавать дальше — бот ответит сам. Команда /new — сбросить обращение.)";
         } else {
             $this->saveMessage($participant, 'bot', $answer);
         }

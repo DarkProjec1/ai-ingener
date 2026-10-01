@@ -27,14 +27,19 @@ class LlmService
 
         $messages[] = ['role' => 'user', 'content' => $userMessage];
 
-        $apiKey = config('services.llm.api_key');
+        $apiKey = trim((string) config('services.llm.api_key', ''));
         $baseUrl = rtrim(config('services.llm.base_url', 'https://api.openai.com/v1'), '/');
         $model = config('services.llm.model', 'gpt-4o-mini');
 
-        // Fallback rule-based engine when no API key (for local/demo)
-        if (empty($apiKey) || $apiKey === 'test') {
+        // Rule-based engine: no key, test, placeholder, or explicit RULES mode
+        $useRules = $apiKey === ''
+            || in_array(strtolower($apiKey), ['test', 'rules', 'none', 'local', 'demo'], true)
+            || str_starts_with($apiKey, 'your-')
+            || $apiKey === 'sk-...';
+
+        if ($useRules) {
             $result = $this->ruleBasedAnswer($userMessage);
-            $this->log($participant, $userMessage, $result, (int) ((microtime(true) - $start) * 1000), $model . '-fallback');
+            $this->log($participant, $userMessage, $result, (int) ((microtime(true) - $start) * 1000), 'rules-fallback');
             return $result;
         }
 
@@ -50,7 +55,10 @@ class LlmService
 
             if (!$response->successful()) {
                 Log::error('LLM API error', ['status' => $response->status(), 'body' => $response->body()]);
-                return $this->fallbackEscalate($userMessage);
+                // Не эскалируем вслепую — отвечаем по правилам
+                $result = $this->ruleBasedAnswer($userMessage);
+                $this->log($participant, $userMessage, $result, (int) ((microtime(true) - $start) * 1000), $model . '-api-fail-rules');
+                return $result;
             }
 
             $content = $response->json('choices.0.message.content', '{}');
@@ -58,7 +66,9 @@ class LlmService
 
             if (!is_array($parsed) || !isset($parsed['answer'])) {
                 Log::warning('LLM returned invalid JSON', ['content' => $content]);
-                return $this->fallbackEscalate($userMessage);
+                $result = $this->ruleBasedAnswer($userMessage);
+                $this->log($participant, $userMessage, $result, (int) ((microtime(true) - $start) * 1000), $model . '-bad-json-rules');
+                return $result;
             }
 
             $result = [
@@ -74,9 +84,12 @@ class LlmService
             return $result;
         } catch (\Throwable $e) {
             Log::error('LLM exception: ' . $e->getMessage());
-            return $this->fallbackEscalate($userMessage);
+            $result = $this->ruleBasedAnswer($userMessage);
+            $this->log($participant, $userMessage, $result, (int) ((microtime(true) - $start) * 1000), 'exception-rules');
+            return $result;
         }
     }
+
 
     /**
      * Deterministic answers for the 25 test requests + common cases.
